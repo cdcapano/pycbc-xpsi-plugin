@@ -21,7 +21,7 @@ setup (
                 'gravitational waves', 'x-ray astronomy',
                 'multimessenger astronomy'],
     install_requires = ['pycbc', 'xpsi'],
-    py_modules = ['pycbc_xpsi'],
+    packages=find_packages(),
     entry_points = {
         "pycbc.inference.models": "pycbc_xpsi = pycbc_xpsi:XPSIModel",
         },
