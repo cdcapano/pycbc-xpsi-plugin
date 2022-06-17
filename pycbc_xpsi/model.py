@@ -18,12 +18,22 @@ class XPSIModel(BaseModel):
     """Model wrapper around XPSI likelihood function."""
     name = 'xpsi'
 
+    # we need to alias some of the parameter names to be compliant with
+    # pycbc config file sections
+    _param_aliases = {
+        'XTI__alpha': 'nicer_alpha',
+        'PN__alpha': 'xmm_alpha'
+        }
+
     def __init__(self, variable_params, star, signals, num_energies, **kwargs):
         super().__init__(variable_params, **kwargs)
         # set up the xpsi likelihood
         self._xpsi_likelihood = xpsi.Likelihood(star=star, signals=signals,
                                                 num_energies=num_energies,
                                                 externally_updated=True)
+        # store a dictionary of param aliases
+        self.param_aliases = {p: p for p in self._xpsi_likelihood.names}
+        self.param_aliases.update(self._param_aliases)
 
     @property
     def star(self):
@@ -34,11 +44,16 @@ class XPSIModel(BaseModel):
         params = self.current_params
         # update the underlying likelihood
         for p in self._xpsi_likelihood.names:
-            self._xpsi_likelihood[p] = params[p]
+            self._xpsi_likelihood[p] = params[self.param_aliases[p]]
         # check addtional constraints
         if not self.apply_additional_constraints():
             return -numpy.inf
-        return self._xpsi_likelihood()
+        logl = self._xpsi_likelihood()
+        # FIXME: for some reason, this occasionally returns arrays of len 1
+        # if so, force to float
+        if isinstance(logl, numpy.ndarray):
+            logl = logl.item()
+        return logl
 
     def apply_additional_constraints(self):
         # FIXME: these should really be applied in the prior, but hard to
@@ -89,11 +104,11 @@ class XPSIModel(BaseModel):
         signals = []
         nicer = None
         if 'nicer' in instruments:
-            nicer = nicer_from_config(cp, alpha_bounds, interstellar)  
+            nicer = nicer_from_config(cp, interstellar, alpha_bounds)
             signals.append(nicer.signal)
         if 'xmm' in instruments:
             # XMM-PN
-            xmm_pn = xmm_pn_from_config(cp, alpha_bounds)
+            xmm_pn = xmm_pn_from_config(cp, interstellar, alpha_bounds)
             signals.append(xmm_pn.signal)
             # for the other xmm instruments
             # FIXME: this is wonky. I think they did this so that the
@@ -109,16 +124,18 @@ class XPSIModel(BaseModel):
                     return xmm_pn.instrument['alpha']
             derived_values = derive()
             # XMM-MOS1
-            xmm_mos1 = xmm_mos1_from_config(cp, derived_values=derived_values)
+            xmm_mos1 = xmm_mos1_from_config(cp, interstellar,
+                                            derived_values=derived_values)
             signals.append(xmm_mos1.signal)
             # XMM-MOS2
-            xmm_mos2 = xmm_mos2_from_config(cp, derived_values=derived_values)
+            xmm_mos2 = xmm_mos2_from_config(cp, interstellar,
+                                            derived_values=derived_values)
             signals.append(xmm_mos2.signal)
         # load the spacetime
         spacetime = spacetime_from_config(cp)
         # load the hotregions
         hotregions = hotregions_from_config(cp)
-        photospheres = photosphere_from_config(cp, hotregions)
+        photosphere = photosphere_from_config(cp, hotregions, spacetime.f)
         star = xpsi.Star(spacetime=spacetime,
                          photospheres=photosphere)
         args['star'] = star
@@ -153,7 +170,7 @@ def interstellar_from_config(cp):
     return interstellar
 
 
-def signal_from_config(cp, instrument, interstellar, **kwargs):
+def signal_from_config(cp, data, instrument, interstellar, **kwargs):
     section = 'signal'
     workspace_intervals = int(cp.get(section, 'workspace-intervals'))
     epsrel = float(cp.get(section, 'epsrel'))
@@ -169,7 +186,7 @@ def signal_from_config(cp, instrument, interstellar, **kwargs):
     return signal
 
 
-def nicer_from_config(cp, alpha_bounds, interstellar):
+def nicer_from_config(cp, interstellar, alpha_bounds):
     section = 'nicer'
     counts = numpy.loadtxt(cp.get(section, 'matrix-path'))
     # channels
@@ -212,7 +229,7 @@ def nicer_from_config(cp, alpha_bounds, interstellar):
                                             channel_edges=channel_edges,
                                             prefix='XTI')
     # load the signal
-    signal = signal_from_config(cp, instrument, interstellar)
+    signal = signal_from_config(cp, data, instrument, interstellar)
     return Instrument(data, instrument, signal)
 
 
@@ -229,7 +246,7 @@ def handle_XMM_event_list(event_list_path, instrument):
     return spectrum.reshape(-1,1) # count spectrum
 
 
-def xmm_pn_from_config(cp, alpha_bounds):
+def xmm_pn_from_config(cp, interstellar, alpha_bounds):
     section = 'xmm_pn'
     arf = cp.get(section, 'arf-path')
     rmf = cp.get(section, 'rmf-path')
@@ -293,11 +310,13 @@ def xmm_pn_from_config(cp, alpha_bounds):
     support *= 0.9212 * (data.exposure_time / 4.51098e5) # BACKSCAL x exposure ratio
     support /= data.exposure_time # need count rate, so divide by exposure time
     # setup the signal model
-    signal = signal_from_config(cp, instrument, interstellar, support=support)
+    signal = signal_from_config(cp, data, instrument, interstellar,
+                                support=support)
     return Instrument(data, instrument, signal)
 
 
-def xmm_mos1_from_config(cp, alpha_bounds=None, derived_values=None):
+def xmm_mos1_from_config(cp, interstellar, alpha_bounds=None,
+                         derived_values=None):
     section = 'xmm_mos1'
     arf = cp.get(section, 'arf-path')
     rmf = cp.get(section, 'rmf-path')
@@ -362,11 +381,13 @@ def xmm_mos1_from_config(cp, alpha_bounds=None, derived_values=None):
     support *= 1.074 * (data.exposure_time / 1.57623e6) # BACKSCAL x exposure ratio
     support /= data.exposure_time # need count rate, so divide by exposure time
     # setup the signal model
-    signal = signal_from_config(cp, instrument, interstellar, support=support)
+    signal = signal_from_config(cp, data, instrument, interstellar,
+                                support=support)
     return Instrument(data, instrument, signal)
 
 
-def xmm_mos2_from_config(cp, alpha_bounds=None, derived_values=None):
+def xmm_mos2_from_config(cp, interstellar, alpha_bounds=None,
+                         derived_values=None):
     section = 'xmm_mos2'
     arf = cp.get(section, 'arf-path')
     rmf = cp.get(section, 'rmf-path')
@@ -433,7 +454,8 @@ def xmm_mos2_from_config(cp, alpha_bounds=None, derived_values=None):
     support *= 1.260 * (data.exposure_time / 1.51256e6) # BACKSCAL x exposure ratio
     support /= data.exposure_time # need count rate, so divide by exposure time
     # setup the signal model
-    signal = signal_from_config(cp, instrument, interstellar, support=support)
+    signal = signal_from_config(cp, data, instrument, interstellar,
+                                support=support)
     return Instrument(data, instrument, signal)
 
 
@@ -452,7 +474,7 @@ def spacetime_from_config(cp):
                           {'frequency': spacetime_freq})
 
 
-def read_hotspot_args(section, common=None):
+def read_hotspot_args(cp, section, common=None):
     if common is None:
         out = {}
     else:
@@ -501,11 +523,11 @@ def hotregions_from_config(cp):
         )
     }
     # get the common options
-    common_opts = read_hotspot_args(section)
+    common_opts = read_hotspot_args(cp, section)
     # load the spots
     spots = []
     for tag in spottags:
-        spotopts = read_hotspot_args('-'.join([section, tag]),
+        spotopts = read_hotspot_args(cp, '-'.join([section, tag]),
                                      common=common_opts)
         bnds = hotspots_bounds[tag]
         spots.append(xpsi.HotRegion(bounds=bnds,
@@ -515,7 +537,7 @@ def hotregions_from_config(cp):
     return xpsi.HotRegions(tuple(spots))
 
 
-def photosphere_from_config(cp, hotregions):
+def photosphere_from_config(cp, hotregions, spacetime_freq):
     # load the photosphere
     section = 'photosphere'
     photosphere = CustomPhotosphere(
